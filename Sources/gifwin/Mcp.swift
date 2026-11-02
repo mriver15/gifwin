@@ -92,13 +92,39 @@ enum Mcp {
             "description": "Record one application window to a GIF for a fixed number of seconds. Returns the file path plus a contact sheet image of six keyframes with timestamps (look at it to verify what was recorded), a manifest path with the app version, window, hash and OCR text, and a caption. Still footage at the start and end is trimmed automatically. The macOS recording indicator is shown while it runs.",
             "inputSchema": ["type": "object", "properties": [
                 "window": ["type": "string", "description": "Which window. An app name (\"Safari\"), a bundle id, \"id:<n>\" from list_windows, \"title~<text>\" for a title substring, \"text:<words>\" for a window showing that text, or \"ask:<words>\" for the window that best matches several words. Ambiguity is an error that lists the candidates."],
-                "seconds": ["type": "number", "minimum": 0.2, "maximum": 60, "description": "How long to record. Default 5."],
+                "seconds": ["type": "number", "minimum": 0.2, "maximum": 60, "description": "How long to record, or with until the longest it will record. Default 5."],
+                "until": ["type": "string", "description": "Stop early when something happens: \"text:<words>\" once those words appear on screen, \"quiet:<seconds>\" once the screen has been still that long after changing, or \"change\" at the first change. Use it to capture a moment you cannot time, such as a build finishing."],
+                "after": ["type": "number", "minimum": 0, "maximum": 10, "description": "With until: seconds to keep recording after the condition is met, so the moment is in the clip. Default 1."],
+                "redact": ["type": "string", "enum": ["auto", "none"], "description": "auto blanks credentials, tokens, emails and card numbers out of the pixels while recording. Default auto. Best effort: check the result's redaction field."],
                 "quality": ["type": "string", "enum": ["draft", "balanced", "crisp", "max"], "description": "Default balanced, about 100-250 KB for 5 seconds of an app window."],
                 "max_bytes": ["type": "integer", "minimum": 10000, "description": "Reduce colours, then frame rate, then size until the file fits. Reports whether it did."],
                 "out_dir": ["type": "string", "description": "Directory for the output. Default $GIFWIN_OUT or ~/Pictures/Gifwin."],
                 "name": ["type": "string", "description": "File name, without a directory. Default <app>-<timestamp>.gif."],
                 "read_text": ["type": "boolean", "description": "Run OCR and write a caption. Default true; false skips both and still writes the sheet and manifest."],
             ], "required": ["window"], "additionalProperties": false],
+            "annotations": ["readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false],
+        ],
+        [
+            "name": "watch",
+            "description": "Keep the last N seconds of a window in memory so a moment can be saved after it has happened (a bug, a failure). start begins watching, which keeps the macOS recording indicator on; stop ends it; status lists what is watched. Use save_last to write the footage out.",
+            "inputSchema": ["type": "object", "properties": [
+                "action": ["type": "string", "enum": ["start", "stop", "status"], "description": "Default start."],
+                "window": ["type": "string", "description": "Which window, as for capture_gif. Needed to start; with stop, omit to stop all."],
+                "rolling_seconds": ["type": "number", "minimum": 5, "maximum": 300, "description": "How much to keep. Default 30."],
+                "redact": ["type": "string", "enum": ["auto", "none"], "description": "Default auto."],
+            ], "additionalProperties": false],
+            "annotations": ["readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false],
+        ],
+        [
+            "name": "save_last",
+            "description": "Write the last few seconds of a watched window to a GIF, after something has already happened. Returns the same evidence as capture_gif: the file, a contact sheet image to check, a manifest and a caption. The clip may run up to about two seconds longer than asked, because it has to start on a full frame.",
+            "inputSchema": ["type": "object", "properties": [
+                "seconds": ["type": "number", "minimum": 1, "maximum": 300, "description": "How far back to go. Default 8."],
+                "window": ["type": "string", "description": "Which watched window. Omit if only one is watched."],
+                "out_dir": ["type": "string", "description": "Directory for the output. Default $GIFWIN_OUT or ~/Pictures/Gifwin."],
+                "name": ["type": "string", "description": "File name, without a directory."],
+                "read_text": ["type": "boolean", "description": "Run OCR and write a caption. Default true."],
+            ], "additionalProperties": false],
             "annotations": ["readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false],
         ],
         [
@@ -124,6 +150,9 @@ enum Mcp {
             args = ["--json", "--window", window, "--seconds", String(seconds)]
             if let q = arguments["quality"] as? String { args += ["--quality", q] }
             if let b = arguments["max_bytes"] as? Int { args += ["--max-bytes", String(max(10_000, b))] }
+            if let u = arguments["until"] as? String, !u.isEmpty { args += ["--until", u] }
+            if let a = arguments["after"] as? Double { args += ["--after", String(min(10, max(0, a)))] }
+            args += ["--redact", (arguments["redact"] as? String) == "none" ? "none" : "auto"]
             if let n = arguments["name"] as? String {
                 guard !n.contains("/"), !n.hasPrefix(".") else { return failure("name must be a plain file name, not a path") }
                 args += ["--name", n]
@@ -131,6 +160,29 @@ enum Mcp {
             if (arguments["read_text"] as? Bool) == false { args.append("--no-ai") }
             let out = (arguments["out_dir"] as? String) ?? ProcessInfo.processInfo.environment["GIFWIN_OUT"] ?? "\(home)/Pictures/Gifwin"
             args += ["--out", out]
+        case "watch":
+            let action = (arguments["action"] as? String) ?? "start"
+            args = ["watch", "--json"]
+            switch action {
+            case "status": args.append("--status")
+            case "stop":
+                args.append("--stop")
+                if let w = arguments["window"] as? String, !w.isEmpty { args += ["--window", w] }
+            case "start":
+                guard let w = arguments["window"] as? String, !w.isEmpty else { return failure("watch start needs a window") }
+                args += ["--window", w, "--rolling", String(min(300, max(5, (arguments["rolling_seconds"] as? Double) ?? 30)))]
+                args += ["--redact", (arguments["redact"] as? String) == "none" ? "none" : "auto"]
+            default: return failure("action must be start, stop or status")
+            }
+        case "save_last":
+            args = ["save-last", String(min(300, max(1, (arguments["seconds"] as? Double) ?? 8))), "--json"]
+            if let w = arguments["window"] as? String, !w.isEmpty { args += ["--window", w] }
+            if let n = arguments["name"] as? String {
+                guard !n.contains("/"), !n.hasPrefix(".") else { return failure("name must be a plain file name, not a path") }
+                args += ["--name", n]
+            }
+            if (arguments["read_text"] as? Bool) == false { args.append("--no-ai") }
+            args += ["--out", (arguments["out_dir"] as? String) ?? ProcessInfo.processInfo.environment["GIFWIN_OUT"] ?? "\(home)/Pictures/Gifwin"]
         case "describe_capture":
             guard let path = arguments["path"] as? String, path.hasPrefix("/") else { return failure("describe_capture needs an absolute path") }
             args = ["describe", path, "--json"] + ((arguments["read_text"] as? Bool) == false ? ["--no-ai"] : [])
@@ -138,7 +190,7 @@ enum Mcp {
             return failure("Unknown tool: \(name)")
         }
 
-        let outcome = await Client.dispatch(Request(args: args, cwd: home, env: Client.forwardedEnvironment()))
+        let outcome = await Client.dispatch(Request(args: args, cwd: home, env: Client.forwardedEnvironment(), caller: "mcp"))
         return result(from: outcome, tool: name)
     }
 

@@ -2,6 +2,16 @@ import Foundation
 import ScreenCaptureKit
 
 public struct WindowInfo: Sendable {
+    public init(id: UInt32, app: String, bundleID: String, pid: Int32, title: String, width: Int, height: Int) {
+        self.id = id
+        self.app = app
+        self.bundleID = bundleID
+        self.pid = pid
+        self.title = title
+        self.width = width
+        self.height = height
+    }
+
     public let id: UInt32
     public let app: String
     public let bundleID: String

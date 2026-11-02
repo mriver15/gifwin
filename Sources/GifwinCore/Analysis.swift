@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreGraphics
 import CoreText
 import Foundation
@@ -6,7 +7,7 @@ import UniformTypeIdentifiers
 
 /// What a finished GIF looks like over time, measured once and reused by everything downstream.
 public struct ClipIndex {
-    public let source: CGImageSource
+    let imageAt: (Int) -> CGImage?
     public let width: Int
     public let height: Int
     /// Seconds each frame stays on screen.
@@ -17,7 +18,22 @@ public struct ClipIndex {
     public var count: Int { delays.count }
     public var duration: Double { delays.reduce(0, +) }
     public func start(of frame: Int) -> Double { delays[..<frame].reduce(0, +) }
-    public func image(_ frame: Int) -> CGImage? { CGImageSourceCreateImageAtIndex(source, frame, nil) }
+    public func image(_ frame: Int) -> CGImage? { imageAt(frame) }
+}
+
+/// Frames pulled out of a video, kept so each is decoded once however many times it is asked for.
+final class FrameCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frames: [Int: CGImage] = [:]
+
+    func image(_ index: Int, _ make: () -> CGImage?) -> CGImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = frames[index] { return cached }
+        let made = make()
+        if let made { frames[index] = made }
+        return made
+    }
 }
 
 public enum Analysis {
@@ -38,7 +54,57 @@ public enum Analysis {
             previous = small
         }
         guard !delays.isEmpty else { throw GifwinError(.internalFailure, "\(url.lastPathComponent) has no decodable frames") }
-        return ClipIndex(source: src, width: first.width, height: first.height, delays: delays, energy: energy)
+        return ClipIndex(imageAt: { CGImageSourceCreateImageAtIndex(src, $0, nil) },
+                         width: first.width, height: first.height, delays: delays, energy: energy)
+    }
+
+    /// A GIF or a video, whichever `url` is. A video is sampled, not decoded in full: enough frames to
+    /// see how it changes, which is all the contact sheet and keyframe choice need.
+    public static func indexAny(_ url: URL) async throws -> ClipIndex {
+        switch url.pathExtension.lowercased() {
+        case "mp4", "mov", "m4v": return try await indexVideo(url)
+        case "webm": throw GifwinError(.internalFailure, "macOS cannot read WebM; analyse the MP4 it was made from instead.")
+        default: return try index(url)
+        }
+    }
+
+    static func indexVideo(_ url: URL) async throws -> ClipIndex {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let size = try? await track.load(.naturalSize),
+              let length = try? await asset.load(.duration), length.seconds > 0 else {
+            throw GifwinError(.internalFailure, "Cannot read \(url.lastPathComponent) as a video")
+        }
+        let duration = length.seconds
+        let samples = min(48, max(6, Int(duration * 4)))
+        let times = (0..<samples).map { CMTime(seconds: duration * (Double($0) + 0.5) / Double(samples), preferredTimescale: 600) }
+
+        let small = AVAssetImageGenerator(asset: asset)
+        small.appliesPreferredTrackTransform = true
+        small.maximumSize = CGSize(width: 160, height: 160 * size.height / max(size.width, 1))
+        small.requestedTimeToleranceBefore = CMTime(seconds: 0.1, preferredTimescale: 600)
+        small.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
+        var energy: [Double] = []
+        var previous: [UInt32]?
+        for t in times {
+            guard let image = try? await small.image(at: t).image else { energy.append(0); continue }
+            let px = Fit.bgra(image, width: image.width, height: image.height)
+            energy.append(previous.flatMap { $0.count == px.count ? meanChange($0, px) : nil } ?? 0)
+            previous = px
+        }
+
+        let full = AVAssetImageGenerator(asset: asset)
+        full.appliesPreferredTrackTransform = true
+        full.requestedTimeToleranceBefore = CMTime(seconds: 0.1, preferredTimescale: 600)
+        full.requestedTimeToleranceAfter = CMTime(seconds: 0.1, preferredTimescale: 600)
+        let cache = FrameCache()
+        return ClipIndex(imageAt: { i in
+            guard times.indices.contains(i) else { return nil }
+            // Synchronous on purpose, and serialised by the cache's lock: the generator is not safe to
+            // call from several threads at once. copyCGImage is deprecated but is the only blocking API.
+            return cache.image(i) { try? full.copyCGImage(at: times[i], actualTime: nil) }
+        }, width: Int(size.width), height: Int(size.height),
+           delays: [Double](repeating: duration / Double(samples), count: samples), energy: energy)
     }
 
     private static func meanChange(_ a: [UInt32], _ b: [UInt32]) -> Double {

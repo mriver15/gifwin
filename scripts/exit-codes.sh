@@ -12,7 +12,9 @@ APP="${1:-build/Gifwin.app}"
 export GIFWIN_APP="${APP:A}"
 BIN="$GIFWIN_APP/Contents/MacOS/gifwin"
 OUT="$(mktemp -d)"
-trap 'rm -rf "$OUT"; "$BIN" quit >/dev/null 2>&1' EXIT
+# Policy and the audit log live in a scratch directory, never in the real home.
+export GIFWIN_CONFIG_DIR="$OUT/config" GIFWIN_STATE_DIR="$OUT/state"
+trap 'chflags nouappnd "$OUT/state/log.jsonl" 2>/dev/null; rm -rf "$OUT"; "$BIN" quit >/dev/null 2>&1' EXIT
 
 pass=0; fail=0; skip=0
 expect() { # expect <code> <label> <command...>
@@ -36,6 +38,20 @@ expect 74 "window closed (simulated)"        env GIFWIN_FAULT=window-closed "$BI
 expect 64 "describe without a path"          "$BIN" describe
 expect 64 "describe a missing file"          "$BIN" describe /no/such/file.gif
 expect 64 "bad --trim value"                 "$BIN" 1 -w x --trim sideways
+expect 64 "unknown --format"                 "$BIN" 1 -w x --format avi
+expect 64 "--max-bytes with a video"         "$BIN" 1 -w x --format mp4 --max-bytes 1k
+expect 64 "bad --until"                      "$BIN" 1 -w x --until later
+expect 64 "bad --redact"                     "$BIN" 1 -w x --redact maybe
+expect 77 "policy: password manager"         env GIFWIN_FAULT=fake-window:com.1password.1password:Vault "$BIN" 1 -w x
+expect 70 "policy: --force by a person"      env GIFWIN_FAULT=fake-window:com.1password.1password:Vault "$BIN" 1 -w x --force
+expect 77 "policy: private browser window"   env GIFWIN_FAULT="fake-window:com.google.Chrome:New Tab (Incognito)" "$BIN" 1 -w x
+expect 0  "watch --status, nothing watched"  "$BIN" watch --status
+expect 65 "save-last with nothing watched"   "$BIN" save-last 3
+expect 0  "consent grant"                    "$BIN" consent grant com.example.demo
+expect 0  "consent list"                     "$BIN" consent list
+expect 0  "consent revoke"                   "$BIN" consent revoke com.example.demo
+expect 0  "log shows what happened"          "$BIN" log --tail 5
+expect 0  "menubar --status"                 "$BIN" menubar --status
 expect 73 "output path unwritable"           "$BIN" 1 -w x --out /dev/null/nope
 
 "$BIN" 1 -w x --json --out /dev/null/nope >"$OUT/j" 2>/dev/null

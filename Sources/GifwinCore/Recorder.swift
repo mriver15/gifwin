@@ -1,5 +1,4 @@
 import CoreMedia
-import CoreVideo
 import Foundation
 import ScreenCaptureKit
 
@@ -20,6 +19,12 @@ public struct CaptureResult: Sendable {
     public var trimmedTail = 0.0
     /// Device pixels per point of the display the window was on.
     public var displayScale = 1.0
+    /// `timeout` (ran the full duration), `predicate` (the `--until` condition was met) or `closed`.
+    public var stoppedBy = "timeout"
+    /// Seconds into the clip at which the predicate was met.
+    public var predicateTime: Double?
+    /// Regions blanked by pixel redaction over the clip, when it was on.
+    public var maskedRegions = 0
 
     public init(url: URL, width: Int, height: Int, frames: Int, bytes: Int, seconds: Double, truncated: Bool,
                 budgetMet: Bool = true, budgetSteps: Int = 0) {
@@ -35,126 +40,102 @@ public struct CaptureResult: Sendable {
     }
 }
 
-/// Receives ScreenCaptureKit frames and streams them through a `FrameEncoder`.
-public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
-    private let destination: URL
-    private let settings: EncoderSettings
-    private var encoder: FrameEncoder?
-    private var failure: Error?
-    private(set) var streamEnded = false
+/// What the capture in progress is doing, for a status display, and a way to end it early.
+/// One at a time is enough: it serves the menu bar, which starts one capture at a time.
+public enum CaptureProgress {
+    private static let lock = NSLock()
+    private static var started: Date?
+    private static var bytes: (() -> Int)?
+    private static var stopRequested = false
 
-    init(destination: URL, settings: EncoderSettings) {
-        self.destination = destination
-        self.settings = settings
+    public static func begin(bytes: @escaping () -> Int) {
+        lock.lock(); started = Date(); self.bytes = bytes; stopRequested = false; lock.unlock()
+    }
+    public static func end() { lock.lock(); started = nil; bytes = nil; lock.unlock() }
+
+    /// Seconds recorded and bytes written so far, or nil when nothing is recording.
+    public static var current: (seconds: Double, bytes: Int)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let started, let bytes else { return nil }
+        return (Date().timeIntervalSince(started), bytes())
     }
 
-    public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sampleBuffer.isValid, failure == nil else { return }
-        // `.idle` means nothing changed; no pixels, so nothing to encode.
-        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-              let rawStatus = attachments.first?[.status] as? Int,
-              SCFrameStatus(rawValue: rawStatus) == .complete,
-              let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
-        let t = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
-        do {
-            if encoder == nil {
-                let writer = try GIFWriter(url: destination, width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
-                encoder = FrameEncoder(writer: writer, settings: settings)
-            }
-            try encoder?.add(Recorder.pixels(buffer), at: t)
-        } catch {
-            failure = error
-        }
-    }
-
-    public func stream(_ stream: SCStream, didStopWithError error: Error) {
-        streamEnded = true
-    }
-
-    /// Closes the file. Call after the stream has stopped and its queue drained.
-    func finish(endTime: Double) throws -> EncodeStats? {
-        if let failure { throw failure }
-        return try encoder?.finish(endTime: endTime)
-    }
-
-    /// Copies a BGRA buffer into a tightly packed array, dropping row padding.
-    static func pixels(_ buffer: CVPixelBuffer) -> [UInt32] {
-        CVPixelBufferLockBaseAddress(buffer, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
-        let stride = CVPixelBufferGetBytesPerRow(buffer)
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return [UInt32](repeating: 0, count: w * h) }
-        return [UInt32](unsafeUninitializedCapacity: w * h) { out, count in
-            for y in 0..<h {
-                let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt32.self)
-                (out.baseAddress! + y * w).update(from: row, count: w)
-            }
-            count = w * h
-        }
-    }
+    public static func requestStop() { lock.lock(); stopRequested = true; lock.unlock() }
+    static var shouldStop: Bool { lock.lock(); defer { lock.unlock() }; return stopRequested }
 }
 
 public enum Capture {
-    public static func record(window: SCWindow, seconds: Double, to url: URL,
-                              settings: EncoderSettings, longEdge: Int? = nil) async throws -> CaptureResult {
-        let filter = SCContentFilter(desktopIndependentWindow: window)
-        let info = SCShareableContent.info(for: filter)
+    /// Records one window to a GIF.
+    ///
+    /// - Parameters:
+    ///   - seconds: the longest it will record. With `until`, it stops earlier when the condition is met.
+    ///   - after: how long to keep recording once `until` is met, so the moment itself is in the clip.
+    public static func record(window: SCWindow, seconds: Double, to url: URL, settings: EncoderSettings,
+                              longEdge: Int? = nil, redact: Bool = false, format: OutputFormat = .gif,
+                              until: StopCondition? = nil, after: Double = 1) async throws -> CaptureResult {
+        let source = SCKFrameSource(window: window, settings: settings, longEdge: longEdge)
+        var result = try await record(source: source, seconds: seconds, to: url, settings: settings,
+                                      redact: redact, format: format, until: until, after: after)
+        result.displayScale = source.displayScale
+        return result
+    }
 
-        // Pixel size = window points x backing scale, capped on the long edge.
-        let pixelScale = Double(info.pointPixelScale)
-        var w = Double(info.contentRect.width) * pixelScale
-        var h = Double(info.contentRect.height) * pixelScale
-        let shrink = min(1, Double(longEdge ?? settings.longEdge) / max(w, h))
-        w = (w * shrink).rounded()
-        h = (h * shrink).rounded()
-
-        let config = SCStreamConfiguration()
-        config.width = Int(w)
-        config.height = Int(h)
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.minimumFrameInterval = CMTime(seconds: 1 / settings.fps, preferredTimescale: 600)
-        config.queueDepth = 5
-        config.showsCursor = true
-        config.ignoreShadowsSingleWindow = true
-        config.colorSpaceName = CGColorSpace.sRGB
-
-        let recorder = Recorder(destination: url, settings: settings)
-        let queue = DispatchQueue(label: "gifwin.frames")
-        let stream = SCStream(filter: filter, configuration: config, delegate: recorder)
-        try stream.addStreamOutput(recorder, type: .screen, sampleHandlerQueue: queue)
-
-        do {
-            try await stream.startCapture()
-        } catch {
-            throw GifwinError.permission("Could not start capture: \(error.localizedDescription)")
+    /// The same, from any frame source. This is the path the tests drive.
+    public static func record(source: FrameSource, seconds: Double, to url: URL, settings: EncoderSettings,
+                              redact: Bool = false, format: OutputFormat = .gif,
+                              until: StopCondition? = nil, after: Double = 1) async throws -> CaptureResult {
+        // `format` is how it is recorded: webm is recorded as mp4 and converted afterwards.
+        let intake: Intake
+        if format == .gif {
+            intake = Intake(settings: settings, redact: redact, predicate: until, after: after,
+                            inlinePredicate: source.isScripted) { w, h in try GIFWriter(url: url, width: w, height: h) }
+        } else {
+            intake = Intake(redact: redact, predicate: until, after: after, inlinePredicate: source.isScripted) { w, h in
+                try VideoEncoder(url: url, width: w, height: h, fps: settings.fps, bitsPerPixel: Double(settings.colors) / 64)
+            }
         }
+        try await source.start { pixels, w, h, t in intake.feed(pixels, w, h, t) }
+        CaptureProgress.begin { intake.bytes }
+        defer { CaptureProgress.end() }
 
-        // Poll so a window that closes mid-capture ends the wait early instead of idling to the deadline.
+        // Poll so a window that closes, or a predicate that fires, ends the wait early instead of idling to the deadline.
         let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline && !recorder.streamEnded {
+        var stoppedBy = "timeout"
+        var firedAt: Double?
+        while Date() < deadline && !source.hasEnded {
+            if CaptureProgress.shouldStop { stoppedBy = "stopped"; break }
+            if let fired = intake.firedTime(now: source.now) {
+                firedAt = fired
+                if source.now >= fired + after { stoppedBy = "predicate"; break }
+            }
             try await Task.sleep(for: .milliseconds(50))
         }
-        let truncated = recorder.streamEnded
-        // The clip ends when the deadline passed, not when stopCapture finishes tearing the stream down.
-        let endTime = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
-        if !truncated { try? await stream.stopCapture() }
-        queue.sync {} // drain frames already delivered
+        if let reason = source.endReason, stoppedBy == "timeout" {
+            // A scripted source runs out all at once, so the predicate may have fired inside it.
+            if let fired = intake.firedTime(now: source.now) { firedAt = fired; stoppedBy = "predicate" }
+            else { stoppedBy = reason }
+        }
+        // The clip ends when the deadline passed, not when the stream finishes tearing down.
+        let endTime = min(source.now, firedAt.map { $0 + after } ?? .infinity)
+        await source.stop()
 
         let stats: EncodeStats?
         do {
-            stats = try recorder.finish(endTime: endTime)
+            stats = try intake.finish(endTime: endTime)
         } catch {
-            throw GifwinError(.outputUnwritable, "Could not write GIF: \(error.localizedDescription)")
+            if let e = error as? GifwinError { throw e }
+            throw GifwinError(.outputUnwritable, "Could not write \(url.lastPathComponent): \(error.localizedDescription)")
         }
         guard let stats else {
             throw GifwinError(.internalFailure, "No frames were delivered. Is the window visible and not minimized?")
         }
         var result = CaptureResult(url: url, width: stats.width, height: stats.height, frames: stats.frames,
-                                   bytes: stats.bytes, seconds: stats.duration, truncated: truncated)
+                                   bytes: stats.bytes, seconds: stats.duration, truncated: stoppedBy == "closed")
         result.trimmedHead = stats.trimmedHead
         result.trimmedTail = stats.trimmedTail
-        result.displayScale = pixelScale
+        result.stoppedBy = stoppedBy
+        result.maskedRegions = intake.maskedRegions
+        if let firedAt, let first = intake.firstFrameTime { result.predicateTime = max(0, firedAt - first) }
         return result
     }
 }

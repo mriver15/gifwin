@@ -12,6 +12,16 @@ public struct EncodeStats: Sendable {
     public let trimmedTail: Double
 }
 
+/// Anything that turns timestamped frames into a finished file. The GIF encoder is one; the video encoder is another.
+public protocol FrameConsumer: AnyObject {
+    /// How many frames were kept, and when the newest was, on the source's clock.
+    var acceptedCount: Int { get }
+    var lastAcceptedTime: Double { get }
+    var bytesWritten: Int { get }
+    func add(_ pixels: [UInt32], at time: Double) throws
+    func finish(endTime: Double) throws -> EncodeStats?
+}
+
 /// Turns a stream of timestamped frames into a compact GIF.
 ///
 /// - Changes are measured against `reference`, the source colour each pixel last had when it was
@@ -21,7 +31,7 @@ public struct EncodeStats: Sendable {
 ///   use the transparent index, so the viewer keeps the old pixel.
 /// - Every frame gets its own Wu palette, built from the changed pixels alone.
 /// - A frame is held back until the next one arrives so its delay is known when it is written.
-public final class FrameEncoder {
+public final class FrameEncoder: FrameConsumer {
     private struct Encoded {
         var x: Int, y: Int, w: Int, h: Int
         var indices: [UInt8]
@@ -31,9 +41,15 @@ public final class FrameEncoder {
 
     public let width: Int
     public let height: Int
-    private let writer: GIFWriter
+    public var bytesWritten: Int { writer.bytesWritten }
+    private let writer: GIFFrameSink
     private let settings: EncoderSettings
     private let minInterval: Double
+    private let keyframeInterval: Double?
+    private var lastKeyTime = -Double.infinity
+    /// When the newest frame was kept, and how many were. Used to tell "nothing has changed" from "nothing arrived".
+    public private(set) var lastAcceptedTime = -Double.infinity
+    public private(set) var acceptedCount = 0
     private let wu = Wu()
 
     private var reference: [UInt32] = []
@@ -41,7 +57,6 @@ public final class FrameEncoder {
     private var pending: Encoded?
     private var pendingTime = 0.0
     private var firstTime = 0.0
-    private var lastAcceptedTime = -Double.infinity
     private var emittedCS = 0.0
     private var trimmedCS = 0.0
     private var trimmedHeadCS = 0.0
@@ -52,9 +67,12 @@ public final class FrameEncoder {
 
     /// - Parameter minInterval: extra spacing (seconds) to enforce beyond the preset's own rate; used
     ///   when re-encoding at a lower rate to meet a byte budget.
-    public init(writer: GIFWriter, settings: EncoderSettings, minInterval: Double = 0) {
+    /// - Parameter keyframeInterval: force a full frame at least this often (seconds). A clip cut from the
+    ///   middle can only start on a full frame, so a rolling buffer needs them.
+    public init(writer: GIFFrameSink, settings: EncoderSettings, minInterval: Double = 0, keyframeInterval: Double? = nil) {
         self.writer = writer
         self.settings = settings
+        self.keyframeInterval = keyframeInterval
         // Never accept frames faster than the preset's rate, whatever the source delivers; the
         // 0.9 leaves room for timestamp jitter on a source that is paced at exactly that rate.
         self.minInterval = max(minInterval, 0.9 / settings.fps)
@@ -73,6 +91,21 @@ public final class FrameEncoder {
             pending = encode(pixels, bounds: (0, 0, width, height), first: true)
             pendingTime = time
             lastAcceptedTime = time
+            lastKeyTime = time
+            acceptedCount = 1
+            return
+        }
+        if let every = keyframeInterval, time - lastKeyTime >= every {
+            // A periodic full frame, whether or not anything changed, so a clip can start here.
+            try flush(until: time)
+            for i in 0..<mask.count { mask[i] = 1 }
+            reference = pixels
+            pending = encode(pixels, bounds: (0, 0, width, height), first: true)
+            pendingTime = time
+            lastAcceptedTime = time
+            lastKeyTime = time
+            acceptedCount += 1
+            heldBack = nil
             return
         }
         if time - lastAcceptedTime < minInterval - 1e-6 {
@@ -106,6 +139,14 @@ public final class FrameEncoder {
                            trimmedHead: trimmedHeadCS / 100, trimmedTail: trimmedTailCS / 100)
     }
 
+    /// The held-back frame as it would be written if the clip ended at `time`, without ending anything.
+    /// Lets a rolling buffer export up to the present moment.
+    public func peekPending(at time: Double) -> (x: Int, y: Int, w: Int, h: Int, indices: [UInt8], palette: [UInt8], transparent: Int?, delayCS: Int)? {
+        guard let f = pending else { return nil }
+        let delay = max(settings.minDelayCS, Int(((time - pendingTime) * 100).rounded()))
+        return (f.x, f.y, f.w, f.h, f.indices, f.palette, f.transparent, delay)
+    }
+
     // MARK: - Accepting frames
 
     private func accept(_ pixels: [UInt32], bounds: (Int, Int, Int, Int), at time: Double, closing: Bool = false) throws {
@@ -113,6 +154,7 @@ public final class FrameEncoder {
         pending = encode(pixels, bounds: bounds, first: false)
         pendingTime = time
         lastAcceptedTime = time
+        acceptedCount += 1
         heldBack = nil
     }
 

@@ -14,7 +14,11 @@ enum Server {
     private static var busy = 0
     private static var lastActivity = Date()
 
-    static func run() -> Never {
+    /// The menu-bar helper is meant to stay; otherwise it retires when idle.
+    private static var staysResident = false
+
+    static func run(menubar: Bool = false) -> Never {
+        staysResident = menubar
         let listener: Int32
         do {
             listener = try Socket.listen()
@@ -41,12 +45,14 @@ enum Server {
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler {
             lock.lock()
-            let idle = busy == 0 && Date().timeIntervalSince(lastActivity) >= idleSeconds
+            // A helper that is watching a window is doing its job; only an idle one retires.
+            let idle = !staysResident && busy == 0 && Watchers.count == 0 && Date().timeIntervalSince(lastActivity) >= idleSeconds
             lock.unlock()
             if idle { shutdown() }
         }
         timer.resume()
 
+        if menubar { MenuBar.shared.install() }
         app.run()
         exit(0)
     }
@@ -74,7 +80,9 @@ enum Server {
             shutdown()
         }
 
-        let outcome = await Command.run(request)
+        var resident = request
+        resident.env["GIFWIN_RESIDENT"] = "1"   // set here, never taken from the client: it vouches that a buffer will survive
+        let outcome = await Command.run(resident)
         if let path = outcome.clipboardPath { Clipboard.copy(path: path) }
         Socket.writeAll(fd, (try? JSONEncoder().encode(outcome)) ?? Data())
     }

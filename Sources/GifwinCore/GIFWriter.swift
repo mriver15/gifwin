@@ -1,9 +1,19 @@
 import Foundation
 
+/// Where encoded frames go: a file while recording, or memory while watching.
+public protocol GIFFrameSink: AnyObject {
+    var width: Int { get }
+    var height: Int { get }
+    var frameCount: Int { get }
+    var bytesWritten: Int { get }
+    func addFrame(x: Int, y: Int, w: Int, h: Int, indices: [UInt8], palette: [UInt8], transparent: Int?, delayCS: Int) throws
+    func finish() throws
+}
+
 /// Streaming GIF89a writer. Each frame carries its own local colour table, a sub-rectangle,
 /// and an optional transparent index, so a frame can paint only the pixels that changed.
 /// Frames are LZW-compressed and written as they arrive; memory stays near one frame.
-public final class GIFWriter {
+public final class GIFWriter: GIFFrameSink {
     public let width: Int
     public let height: Int
     public private(set) var frameCount = 0
@@ -18,27 +28,33 @@ public final class GIFWriter {
         self.height = height
         FileManager.default.createFile(atPath: url.path, contents: nil)
         handle = try FileHandle(forWritingTo: url)
+        try write(Self.header(width: width, height: height))
+    }
 
+    /// Signature, screen descriptor and the loop-forever extension. No global colour table: every frame brings its own.
+    public static func header(width: Int, height: Int) -> Data {
         var header = Data("GIF89a".utf8)
         header.appendLE16(width)
         header.appendLE16(height)
-        header.append(contentsOf: [0x70, 0x00, 0x00]) // no global table; every frame brings its own
+        header.append(contentsOf: [0x70, 0x00, 0x00])
         header.append(contentsOf: [0x21, 0xFF, 0x0B])
         header.append(Data("NETSCAPE2.0".utf8))
-        header.append(contentsOf: [0x03, 0x01, 0x00, 0x00, 0x00]) // loop forever
-        try write(header)
+        header.append(contentsOf: [0x03, 0x01, 0x00, 0x00, 0x00])
+        return header
     }
 
+    public static let trailer = Data([0x3B])
+
+    /// One complete frame: graphic control, image descriptor, local colour table and LZW data.
+    ///
     /// - Parameters:
     ///   - indices: `w * h` palette indices for the rectangle, row-major.
-    ///   - palette: RGB triplets. Padded to a power of two here; the transparent index, if any, must be inside it.
+    ///   - palette: RGB triplets, padded to a power of two. The transparent index, if any, must be inside it.
     ///   - transparent: index drawn as "leave the previous pixel", or nil.
-    public func addFrame(x: Int = 0, y: Int = 0, w: Int, h: Int, indices: [UInt8],
-                         palette: [UInt8], transparent: Int?, delayCS: Int) throws {
-        precondition(!finished && indices.count == w * h && w > 0 && h > 0)
-        precondition(x >= 0 && y >= 0 && x + w <= width && y + h <= height)
+    public static func frameBlock(x: Int, y: Int, w: Int, h: Int, indices: [UInt8], palette: [UInt8],
+                                  transparent: Int?, delayCS: Int) -> Data {
         let entries = palette.count / 3
-        precondition(entries >= 1 && entries <= 256)
+        precondition(entries >= 1 && entries <= 256 && indices.count == w * h && w > 0 && h > 0)
         var bits = 1
         while (1 << bits) < entries { bits += 1 }
         let minCode = max(2, bits)
@@ -66,14 +82,21 @@ public final class GIFWriter {
             offset += n
         }
         block.append(0x00)
-        try write(block)
+        return block
+    }
+
+    public func addFrame(x: Int = 0, y: Int = 0, w: Int, h: Int, indices: [UInt8],
+                         palette: [UInt8], transparent: Int?, delayCS: Int) throws {
+        precondition(!finished && x >= 0 && y >= 0 && x + w <= width && y + h <= height)
+        try write(Self.frameBlock(x: x, y: y, w: w, h: h, indices: indices, palette: palette,
+                                  transparent: transparent, delayCS: delayCS))
         frameCount += 1
     }
 
     public func finish() throws {
         guard !finished else { return }
         finished = true
-        try write(Data([0x3B]))
+        try write(Self.trailer)
         try handle.close()
     }
 
@@ -138,7 +161,7 @@ enum LZW {
     }
 }
 
-private extension Data {
+extension Data {
     mutating func appendLE16(_ v: Int) {
         append(UInt8(v & 0xFF))
         append(UInt8((v >> 8) & 0xFF))

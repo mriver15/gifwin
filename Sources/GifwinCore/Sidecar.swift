@@ -1,3 +1,4 @@
+import CoreGraphics
 import CryptoKit
 import Foundation
 
@@ -40,6 +41,8 @@ public struct Manifest: Codable, Sendable {
     public struct Tool: Codable, Sendable { public var name: String; public var version: String }
     public struct OS: Codable, Sendable { public var version: String; public var build: String }
     public struct Output: Codable, Sendable {
+        /// gif, mp4 or webm.
+        public var format: String
         public var file: String
         public var bytes: Int
         public var sha256: String
@@ -68,6 +71,15 @@ public struct Manifest: Codable, Sendable {
         public var captionNote: String?
         /// False when `--no-ai` skipped OCR and the model.
         public var ocr: Bool
+        public var redaction: Redaction
+    }
+    public struct Redaction: Codable, Sendable {
+        /// Pixel redaction (`--redact auto`) was applied while recording.
+        public var pixels: Bool
+        /// Secret-looking strings replaced with [REDACTED] in the text below and in the caption.
+        public var textMasked: Int
+        /// Secret-looking strings still readable in the finished clip's keyframes. Should be 0 when `pixels` is on.
+        public var residualInOutput: Int
     }
 
     public var schema = "gifwin.manifest/1"
@@ -103,22 +115,37 @@ public enum Sidecar {
     ///
     /// - Parameter ai: run OCR and the caption model. Off, the keyframes and sheet are still made but
     ///   no text is read and the caption comes from metadata alone.
-    public static func write(gif: URL, capture: CaptureMeta?, result: CaptureResult?, ai: Bool) async throws -> SidecarResult {
-        let clip = try Analysis.index(gif)
+    /// - Parameter redacted: pixel redaction was applied during the capture; any secret still readable in
+    ///   the output is then reported as residual.
+    /// - Parameter analyzing: a file to read the frames from when `gif` itself cannot be read, such as the MP4 a WebM was made from.
+    public static func write(gif: URL, capture: CaptureMeta?, result: CaptureResult?, ai: Bool, redacted: Bool = false,
+                             analyzing: URL? = nil) async throws -> SidecarResult {
+        let clip = try await Analysis.indexAny(analyzing ?? gif)
+        let isGIF = gif.pathExtension.lowercased() == "gif"
         let picks = Analysis.keyframes(clip)
 
-        // OCR the keyframes in parallel; recognition is the slowest step and the frames are independent.
+        // Decode the keyframes one at a time (a video's frame extractor is not built for parallel use), then
+        // OCR them in parallel: recognition is the slowest step and the images are independent.
+        let images: [Int: CGImage] = Dictionary(uniqueKeysWithValues: picks.compactMap { f in clip.image(f).map { (f, $0) } })
         var text: [Int: [String]] = [:]
         if ai {
             await withTaskGroup(of: (Int, [String]).self) { group in
                 for frame in picks {
                     group.addTask {
-                        guard let image = clip.image(frame) else { return (frame, []) }
+                        guard let image = images[frame] else { return (frame, []) }
                         return (frame, OCR.lines(in: image))
                     }
                 }
                 for await (frame, lines) in group { text[frame] = lines }
             }
+        }
+
+        // Text read off the screen never goes into a file, or to the caption model, with credentials in it.
+        var masked = 0
+        for (frame, lines) in text {
+            let safe = lines.map { Secrets.mask($0) }
+            masked += safe.reduce(0) { $0 + $1.count }
+            text[frame] = safe.map(\.text)
         }
 
         let data = try Data(contentsOf: gif)
@@ -139,15 +166,16 @@ public enum Sidecar {
             tool: .init(name: "gifwin", version: Command.version),
             os: operatingSystem(),
             capture: capture,
-            output: .init(file: gif.lastPathComponent, bytes: data.count, sha256: sha256(data),
-                          width: clip.width, height: clip.height, frames: clip.count,
+            output: .init(format: gif.pathExtension.lowercased(), file: gif.lastPathComponent, bytes: data.count, sha256: sha256(data),
+                          width: clip.width, height: clip.height, frames: isGIF ? clip.count : (result?.frames ?? clip.count),
                           durationSeconds: (clip.duration * 100).rounded() / 100,
-                          delaysCentiseconds: clip.delays.map { Int(($0 * 100).rounded()) },
+                          delaysCentiseconds: isGIF ? clip.delays.map { Int(($0 * 100).rounded()) } : [],
                           trimmedHeadSeconds: result.map { $0.trimmedHead }, trimmedTailSeconds: result.map { $0.trimmedTail },
                           budgetMet: result.map { $0.budgetMet }),
             analysis: .init(contactSheet: sheetWritten?.lastPathComponent,
                             keyframes: picks.map { .init(index: $0, timeSeconds: (clip.start(of: $0) * 100).rounded() / 100, text: text[$0] ?? []) },
-                            caption: words.caption, altText: words.altText, captionSource: words.source, captionNote: words.note, ocr: ai))
+                            caption: words.caption, altText: words.altText, captionSource: words.source, captionNote: words.note, ocr: ai,
+                            redaction: .init(pixels: redacted, textMasked: masked, residualInOutput: redacted ? masked : 0)))
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

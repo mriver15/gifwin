@@ -13,7 +13,9 @@ from PIL import Image, ImageDraw, ImageFont
 root = Path(__file__).resolve().parent.parent
 app = Path(sys.argv[1] if len(sys.argv) > 1 else root / "build/Gifwin.app").resolve()
 binary = app / "Contents/MacOS/gifwin"
-env = {**os.environ, "GIFWIN_APP": str(app)}
+# Policy and the audit log go to a scratch directory so the test never touches the real ones.
+scratch = Path(tempfile.mkdtemp(prefix="gifwin-mcp-state-"))
+env = {**os.environ, "GIFWIN_APP": str(app), "GIFWIN_CONFIG_DIR": str(scratch / "config"), "GIFWIN_STATE_DIR": str(scratch / "state")}
 
 passed = failed = 0
 def check(ok, what):
@@ -65,7 +67,10 @@ check(s.send("ping")["result"] == {}, "ping")
 
 print("tools/list")
 tools = {t["name"]: t for t in s.send("tools/list")["result"]["tools"]}
-check(set(tools) == {"list_windows", "capture_gif", "describe_capture"}, f"three tools: {sorted(tools)}")
+check(set(tools) == {"list_windows", "capture_gif", "describe_capture", "watch", "save_last"}, f"five tools: {sorted(tools)}")
+props = tools["capture_gif"]["inputSchema"]["properties"]
+check({"until", "after", "redact"} <= set(props) and props["redact"]["enum"] == ["auto", "none"], "capture_gif offers until, after and redact")
+check(tools["watch"]["inputSchema"]["properties"]["action"]["enum"] == ["start", "stop", "status"], "watch has start, stop and status")
 check(tools["capture_gif"]["inputSchema"]["required"] == ["window"], "capture_gif requires only a window")
 check(tools["capture_gif"]["inputSchema"]["properties"]["seconds"]["maximum"] == 60, "duration is bounded in the schema")
 
@@ -97,6 +102,12 @@ r = s.call("describe_capture", {"path": str(work / "nope.gif")})["result"]
 check(r["isError"] is True and r["structuredContent"]["exit_code"] == 64, "missing file is a usage error (64)")
 r = s.call("capture_gif", {"window": "x", "name": "../escape.gif"})["result"]
 check(r["isError"] is True, "a name containing a path is refused")
+r = s.call("watch", {"action": "start"})["result"]
+check(r["isError"] is True, "watch start without a window is a tool error")
+r = s.call("watch", {"action": "explode"})["result"]
+check(r["isError"] is True, "an unknown watch action is a tool error")
+r = s.call("save_last", {"name": "../x.gif"})["result"]
+check(r["isError"] is True, "save_last refuses a name containing a path")
 check(s.send("no/such/method").get("error", {}).get("code") == -32601, "unknown method is -32601")
 check(s.send("tools/call", {"name": "format_disk", "arguments": {}}).get("error", {}).get("code") == -32602, "unknown tool is -32602")
 
@@ -107,6 +118,30 @@ sc = r["structuredContent"]
 check(r["isError"] is True and sc["error"] == "tcc_denied" and sc["exit_code"] == 69, "permission failure is structured: tcc_denied / 69")
 check("Grant Screen Recording" in sc["remediation"] and sc["settings_url"].startswith("x-apple"), "it says exactly what to click")
 faulty.close()
+
+print("policy: an agent is held to it")
+blocked = Server({"GIFWIN_FAULT": "fake-window:com.1password.1password:Vault"})
+blocked.send("initialize", {"protocolVersion": "2025-06-18"})
+r = blocked.call("capture_gif", {"window": "1Password", "redact": "none"})["result"]
+sc = r["structuredContent"]
+check(r["isError"] is True and sc["error"] == "policy_denied" and sc["exit_code"] == 77, "a password manager is refused: policy_denied / 77")
+blocked.close()
+needs = Server({"GIFWIN_FAULT": "fake-window:com.apple.Terminal:zsh"})
+needs.send("initialize", {"protocolVersion": "2025-06-18"})
+r = needs.call("capture_gif", {"window": "Terminal"})["result"]
+sc = r["structuredContent"]
+check(r["isError"] is True and sc["error"] == "consent_required" and sc["grant_command"] == "gifwin consent grant com.apple.Terminal", "an unconsented app asks for consent and names the command")
+needs.close()
+subprocess.run([str(binary), "consent", "grant", "com.apple.Terminal"], env=env, capture_output=True)
+ok = Server({"GIFWIN_FAULT": "fake-window:com.apple.Terminal:zsh"})
+ok.send("initialize", {"protocolVersion": "2025-06-18"})
+r = ok.call("capture_gif", {"window": "Terminal"})["result"]
+check(r["structuredContent"]["error"] != "consent_required", "after the person grants consent it is let through the policy")
+ok.close()
+log = [json.loads(l) for l in (scratch / "state" / "log.jsonl").read_text().splitlines()]
+check(any(e["phase"] == "refused" and e["caller"] == "mcp" for e in log), f"refusals by agents are in the audit log ({len(log)} lines)")
+check(all(e["caller"] == "mcp" for e in log if e["op"] == "capture"), "and are attributed to the agent")
+subprocess.run(["chflags", "nouappnd", str(scratch / "state" / "log.jsonl")])
 
 print("protocol hygiene")
 check(all(json.loads(l) for l in s.raw), "every stdout line is a JSON message")
