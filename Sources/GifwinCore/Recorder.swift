@@ -4,54 +4,61 @@ import Foundation
 import ScreenCaptureKit
 
 public struct CaptureResult: Sendable {
-    public let url: URL
-    public let width: Int
-    public let height: Int
-    public let frames: Int
-    public let bytes: Int
-    public let seconds: Double
+    public var url: URL
+    public var width: Int
+    public var height: Int
+    public var frames: Int
+    public var bytes: Int
+    public var seconds: Double
     /// True when the stream ended before the requested duration (window closed).
-    public let truncated: Bool
+    public var truncated: Bool
+    /// False only when a byte budget was requested and even the end of the ladder was too big.
+    public var budgetMet = true
+    /// Re-encode passes spent meeting the budget.
+    public var budgetSteps = 0
+
+    public init(url: URL, width: Int, height: Int, frames: Int, bytes: Int, seconds: Double, truncated: Bool,
+                budgetMet: Bool = true, budgetSteps: Int = 0) {
+        self.url = url
+        self.width = width
+        self.height = height
+        self.frames = frames
+        self.bytes = bytes
+        self.seconds = seconds
+        self.truncated = truncated
+        self.budgetMet = budgetMet
+        self.budgetSteps = budgetSteps
+    }
 }
 
-/// Receives ScreenCaptureKit frames and streams them into a GIF.
-///
-/// Each frame is held back until the next one arrives so its delay is known before it is
-/// written. ScreenCaptureKit only delivers `.complete` frames when pixels change, so an idle
-/// window costs one frame with a long delay rather than a run of duplicates.
+/// Receives ScreenCaptureKit frames and streams them through a `FrameEncoder`.
 public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let destination: URL
-    private var writer: GIFWriter?
-    private var pending: [UInt8]?
-    private var pendingTime = 0.0
-    private var firstTime = 0.0
-    private var emittedCS = 0.0
+    private let settings: EncoderSettings
+    private var encoder: FrameEncoder?
     private var failure: Error?
     private(set) var streamEnded = false
 
-    init(destination: URL) {
+    init(destination: URL, settings: EncoderSettings) {
         self.destination = destination
+        self.settings = settings
     }
 
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sampleBuffer.isValid, failure == nil else { return }
+        // `.idle` means nothing changed; no pixels, so nothing to encode.
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let rawStatus = attachments.first?[.status] as? Int,
               SCFrameStatus(rawValue: rawStatus) == .complete,
-              let pixels = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+              let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
         let t = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         do {
-            if writer == nil {
-                writer = try GIFWriter(url: destination,
-                                       width: CVPixelBufferGetWidth(pixels),
-                                       height: CVPixelBufferGetHeight(pixels))
-                firstTime = t
+            if encoder == nil {
+                let writer = try GIFWriter(url: destination, width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
+                encoder = FrameEncoder(writer: writer, settings: settings)
             }
-            let indices = Recorder.quantize(pixels)
-            try flushPending(until: t)
-            pending = indices
-            pendingTime = t
+            try encoder?.add(Recorder.pixels(buffer), at: t)
         } catch {
             failure = error
         }
@@ -61,52 +68,32 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         streamEnded = true
     }
 
-    /// Writes the held-back frame and closes the file. Call after the stream has stopped and its queue drained.
-    func finish() throws -> (frames: Int, bytes: Int, width: Int, height: Int, duration: Double)? {
+    /// Closes the file. Call after the stream has stopped and its queue drained.
+    func finish(endTime: Double) throws -> EncodeStats? {
         if let failure { throw failure }
-        guard let writer else { return nil }
-        let now = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
-        try flushPending(until: max(now, pendingTime + 0.02))
-        try writer.finish()
-        return (writer.frameCount, writer.bytesWritten, writer.width, writer.height, emittedCS / 100)
+        return try encoder?.finish(endTime: endTime)
     }
 
-    /// Cumulative rounding: each delay is the gap between the running total and where the next
-    /// frame should start, so a long clip cannot drift. Clamped to 2 cs because viewers promote 0 and 1.
-    private func flushPending(until next: Double) throws {
-        guard let frame = pending, let writer else { return }
-        let target = (next - firstTime) * 100
-        let delay = max(2, Int((target - emittedCS).rounded()))
-        try writer.addFrame(indices: frame, delayCS: delay)
-        emittedCS += Double(delay)
-        pending = nil
-    }
-
-    static func quantize(_ buffer: CVPixelBuffer) -> [UInt8] {
+    /// Copies a BGRA buffer into a tightly packed array, dropping row padding.
+    static func pixels(_ buffer: CVPixelBuffer) -> [UInt32] {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let w = CVPixelBufferGetWidth(buffer), h = CVPixelBufferGetHeight(buffer)
         let stride = CVPixelBufferGetBytesPerRow(buffer)
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return [UInt8](repeating: 0, count: w * h) }
-        var out = [UInt8](repeating: 0, count: w * h)
-        out.withUnsafeMutableBufferPointer { dst in
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return [UInt32](repeating: 0, count: w * h) }
+        return [UInt32](unsafeUninitializedCapacity: w * h) { out, count in
             for y in 0..<h {
-                let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self)
-                for x in 0..<w {
-                    // BGRA
-                    dst[y * w + x] = GIFWriter.Palette.index(r: row[x * 4 + 2], g: row[x * 4 + 1], b: row[x * 4])
-                }
+                let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt32.self)
+                (out.baseAddress! + y * w).update(from: row, count: w)
             }
+            count = w * h
         }
-        return out
     }
 }
 
 public enum Capture {
-    public static let maxLongEdge = 1024.0
-    public static let framesPerSecond = 12.5
-
-    public static func record(window: SCWindow, seconds: Double, to url: URL) async throws -> CaptureResult {
+    public static func record(window: SCWindow, seconds: Double, to url: URL,
+                              settings: EncoderSettings, longEdge: Int? = nil) async throws -> CaptureResult {
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let info = SCShareableContent.info(for: filter)
 
@@ -114,7 +101,7 @@ public enum Capture {
         let pixelScale = Double(info.pointPixelScale)
         var w = Double(info.contentRect.width) * pixelScale
         var h = Double(info.contentRect.height) * pixelScale
-        let shrink = min(1, maxLongEdge / max(w, h))
+        let shrink = min(1, Double(longEdge ?? settings.longEdge) / max(w, h))
         w = (w * shrink).rounded()
         h = (h * shrink).rounded()
 
@@ -122,13 +109,13 @@ public enum Capture {
         config.width = Int(w)
         config.height = Int(h)
         config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.minimumFrameInterval = CMTime(value: 2, timescale: 25)
+        config.minimumFrameInterval = CMTime(seconds: 1 / settings.fps, preferredTimescale: 600)
         config.queueDepth = 5
         config.showsCursor = true
         config.ignoreShadowsSingleWindow = true
         config.colorSpaceName = CGColorSpace.sRGB
 
-        let recorder = Recorder(destination: url)
+        let recorder = Recorder(destination: url, settings: settings)
         let queue = DispatchQueue(label: "gifwin.frames")
         let stream = SCStream(filter: filter, configuration: config, delegate: recorder)
         try stream.addStreamOutput(recorder, type: .screen, sampleHandlerQueue: queue)
@@ -145,20 +132,21 @@ public enum Capture {
             try await Task.sleep(for: .milliseconds(50))
         }
         let truncated = recorder.streamEnded
+        // The clip ends when the deadline passed, not when stopCapture finishes tearing the stream down.
+        let endTime = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
         if !truncated { try? await stream.stopCapture() }
         queue.sync {} // drain frames already delivered
 
-        let finished: (frames: Int, bytes: Int, width: Int, height: Int, duration: Double)?
+        let stats: EncodeStats?
         do {
-            finished = try recorder.finish()
+            stats = try recorder.finish(endTime: endTime)
         } catch {
             throw GifwinError(.outputUnwritable, "Could not write GIF: \(error.localizedDescription)")
         }
-        guard let finished else {
+        guard let stats else {
             throw GifwinError(.internalFailure, "No frames were delivered. Is the window visible and not minimized?")
         }
-        return CaptureResult(url: url, width: finished.width, height: finished.height,
-                             frames: finished.frames, bytes: finished.bytes,
-                             seconds: finished.duration, truncated: truncated)
+        return CaptureResult(url: url, width: stats.width, height: stats.height, frames: stats.frames,
+                             bytes: stats.bytes, seconds: stats.duration, truncated: truncated)
     }
 }

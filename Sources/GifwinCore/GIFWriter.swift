@@ -1,23 +1,9 @@
 import Foundation
 
-/// Streaming GIF89a writer. Frames are LZW-compressed and written as they arrive,
-/// so memory stays at roughly one frame regardless of clip length.
-///
-/// M0 is deliberately naive: one global 3-3-2 palette, full-frame writes, no diffing.
-/// The quantizer and frame diffing replace `Palette` and `addFrame` in M1.
+/// Streaming GIF89a writer. Each frame carries its own local colour table, a sub-rectangle,
+/// and an optional transparent index, so a frame can paint only the pixels that changed.
+/// Frames are LZW-compressed and written as they arrive; memory stays near one frame.
 public final class GIFWriter {
-    public enum Palette {
-        /// 3 bits red, 3 bits green, 2 bits blue.
-        public static func color(_ index: Int) -> (r: UInt8, g: UInt8, b: UInt8) {
-            (UInt8((index >> 5) * 255 / 7), UInt8(((index >> 2) & 7) * 255 / 7), UInt8((index & 3) * 255 / 3))
-        }
-
-        @inline(__always)
-        public static func index(r: UInt8, g: UInt8, b: UInt8) -> UInt8 {
-            (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6)
-        }
-    }
-
     public let width: Int
     public let height: Int
     public private(set) var frameCount = 0
@@ -36,32 +22,42 @@ public final class GIFWriter {
         var header = Data("GIF89a".utf8)
         header.appendLE16(width)
         header.appendLE16(height)
-        header.append(contentsOf: [0xF7, 0x00, 0x00]) // global table, 256 entries; background; aspect
-        for i in 0..<256 {
-            let c = Palette.color(i)
-            header.append(contentsOf: [c.r, c.g, c.b])
-        }
+        header.append(contentsOf: [0x70, 0x00, 0x00]) // no global table; every frame brings its own
         header.append(contentsOf: [0x21, 0xFF, 0x0B])
         header.append(Data("NETSCAPE2.0".utf8))
         header.append(contentsOf: [0x03, 0x01, 0x00, 0x00, 0x00]) // loop forever
         try write(header)
     }
 
-    /// `indices` is `width * height` palette indices, row-major, top row first.
-    public func addFrame(indices: [UInt8], delayCS: Int) throws {
-        precondition(!finished && indices.count == width * height)
+    /// - Parameters:
+    ///   - indices: `w * h` palette indices for the rectangle, row-major.
+    ///   - palette: RGB triplets. Padded to a power of two here; the transparent index, if any, must be inside it.
+    ///   - transparent: index drawn as "leave the previous pixel", or nil.
+    public func addFrame(x: Int = 0, y: Int = 0, w: Int, h: Int, indices: [UInt8],
+                         palette: [UInt8], transparent: Int?, delayCS: Int) throws {
+        precondition(!finished && indices.count == w * h && w > 0 && h > 0)
+        precondition(x >= 0 && y >= 0 && x + w <= width && y + h <= height)
+        let entries = palette.count / 3
+        precondition(entries >= 1 && entries <= 256)
+        var bits = 1
+        while (1 << bits) < entries { bits += 1 }
+        let minCode = max(2, bits)
+
         var block = Data()
-        block.append(contentsOf: [0x21, 0xF9, 0x04, 0x04]) // graphic control: leave in place
+        block.append(contentsOf: [0x21, 0xF9, 0x04, transparent == nil ? 0x04 : 0x05]) // leave in place
         block.appendLE16(min(max(delayCS, 2), 65535))
-        block.append(contentsOf: [0x00, 0x00])
-        block.append(0x2C)
-        block.appendLE16(0)
-        block.appendLE16(0)
-        block.appendLE16(width)
-        block.appendLE16(height)
+        block.append(UInt8(transparent ?? 0))
         block.append(0x00)
-        block.append(8) // LZW minimum code size
-        let compressed = LZW.compress(indices)
+        block.append(0x2C)
+        block.appendLE16(x)
+        block.appendLE16(y)
+        block.appendLE16(w)
+        block.appendLE16(h)
+        block.append(0x80 | UInt8(bits - 1)) // local colour table follows
+        block.append(contentsOf: palette)
+        block.append(contentsOf: [UInt8](repeating: 0, count: (1 << bits) * 3 - palette.count))
+        block.append(UInt8(minCode))
+        let compressed = LZW.compress(indices, minCodeSize: minCode)
         var offset = 0
         while offset < compressed.count {
             let n = min(255, compressed.count - offset)
@@ -88,16 +84,16 @@ public final class GIFWriter {
 }
 
 enum LZW {
-    /// GIF-flavoured LZW with an 8-bit alphabet. Code-size growth follows giflib:
-    /// the size is raised after emitting a code once the next free code reaches 2^size.
-    static func compress(_ pixels: [UInt8]) -> [UInt8] {
-        let clear = 256, eoi = 257
+    /// GIF-flavoured LZW. Code-size growth follows giflib: the size is raised after emitting a
+    /// code once the next free code reaches 2^size.
+    static func compress(_ pixels: [UInt8], minCodeSize: Int) -> [UInt8] {
+        let clear = 1 << minCodeSize, eoi = clear + 1
         var out = [UInt8]()
         out.reserveCapacity(pixels.count / 2)
         var acc: UInt32 = 0
         var nbits = 0
-        var codeSize = 9
-        var next = 258
+        var codeSize = minCodeSize + 1
+        var next = eoi + 1
         var dict = [UInt32: UInt16](minimumCapacity: 4096)
 
         func emit(_ code: Int) {
@@ -128,8 +124,8 @@ enum LZW {
             if next >= 4095 {
                 emit(clear)
                 dict.removeAll(keepingCapacity: true)
-                next = 258
-                codeSize = 9
+                next = eoi + 1
+                codeSize = minCodeSize + 1
             } else {
                 dict[key] = UInt16(next)
                 next += 1

@@ -9,6 +9,7 @@ public enum ExitCode: Int32 {
     case internalFailure = 70
     case outputUnwritable = 73
     case windowClosed = 74
+    case budgetUnreachable = 75
 }
 
 public struct GifwinError: Error {
