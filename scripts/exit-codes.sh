@@ -33,6 +33,9 @@ expect 64 "flag without value"               "$BIN" --seconds
 expect 69 "permission (simulated)"           env GIFWIN_FAULT=tcc "$BIN" 1 -w x
 expect 70 "internal (simulated)"             env GIFWIN_FAULT=internal "$BIN" 1 -w x
 expect 74 "window closed (simulated)"        env GIFWIN_FAULT=window-closed "$BIN" 1 -w x
+expect 64 "describe without a path"          "$BIN" describe
+expect 64 "describe a missing file"          "$BIN" describe /no/such/file.gif
+expect 64 "bad --trim value"                 "$BIN" 1 -w x --trim sideways
 expect 73 "output path unwritable"           "$BIN" 1 -w x --out /dev/null/nope
 
 "$BIN" 1 -w x --json --out /dev/null/nope >"$OUT/j" 2>/dev/null

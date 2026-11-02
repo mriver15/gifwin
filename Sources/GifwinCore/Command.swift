@@ -38,9 +38,11 @@ public enum Command {
 
     public static let usage = """
     usage: gifwin [seconds] --window <selector> [options]
-           gifwin doctor | quit
+           gifwin describe <file.gif> [--json] [--no-ai]
+           gifwin doctor | quit | mcp
 
       -w, --window <selector>   <app name> | <bundle-id> | id:<n> | title~<text>
+                                text:<words> (on-screen text) | ask:<words> (best match)
       -s, --seconds <float>     default 5
       -q, --quality <preset>    draft | balanced | crisp | max   (default balanced)
           --colors <2-256>      override the preset's palette size
@@ -49,8 +51,11 @@ public enum Command {
           --max-bytes <n>       degrade quality until the file fits (accepts 500k, 2m)
       -o, --out <dir>           default $GIFWIN_OUT, else the current directory
           --name <file>         default "<app>-<yyyyMMdd-HHmmss>.gif"
+          --trim <auto|none>    cap still footage at the start and end (default auto)
+          --no-ai               skip OCR and the caption model; the sheet and manifest are still written
+          --no-sidecar          write only the GIF, no contact sheet or manifest
           --clipboard           put the finished file on the pasteboard
-          --list                print capturable windows and exit
+          --list                print capturable windows and exit (--ocr adds what each shows)
           --dry-run             resolve the window, print the plan, capture nothing
           --json                machine-readable result on stdout
           --direct              capture in this process instead of through Gifwin.app
@@ -72,6 +77,10 @@ public enum Command {
         var out: String?
         var name: String?
         var clipboard = false
+        var trim = true
+        var noAI = false
+        var noSidecar = false
+        var ocr = false
         var list = false
         var dryRun = false
         var json = false
@@ -94,6 +103,10 @@ public enum Command {
     private static func execute(_ req: Request, _ out: inout Outcome) async throws {
         if req.args == ["doctor"] {
             doctor(&out)
+            return
+        }
+        if req.args.first == "describe" {
+            try await describe(req, &out)
             return
         }
         let o = try parse(req.args)
@@ -135,19 +148,29 @@ public enum Command {
         let all = try await WindowResolver.candidates()
 
         if o.list {
+            let text = o.ocr ? await WindowText.index(all) : [:]
+            func excerpt(_ id: UInt32) -> String { String((text[id] ?? []).prefix(8).joined(separator: " | ").prefix(240)) }
             if o.json {
                 let rows = all.map { (_, w) -> [String: Any] in
-                    ["id": Int(w.id), "app": w.app, "bundle_id": w.bundleID, "title": w.title, "width": w.width, "height": w.height]
+                    var row: [String: Any] = ["id": Int(w.id), "app": w.app, "bundle_id": w.bundleID, "title": w.title,
+                                              "width": w.width, "height": w.height]
+                    if o.ocr { row["text"] = excerpt(w.id) }
+                    return row
                 }
                 out.stdout += try jsonString(rows)
             } else {
-                for (_, w) in all { out.stdout += "id:\(w.id)\t\(w.app)\t\(w.title)\t\(w.width)x\(w.height)\n" }
+                for (_, w) in all {
+                    out.stdout += "id:\(w.id)\t\(w.app)\t\(w.title)\t\(w.width)x\(w.height)" + (o.ocr ? "\t\(excerpt(w.id))" : "") + "\n"
+                }
             }
             return
         }
 
         let selector = o.window!
-        let (window, info) = try WindowResolver.resolve(selector, in: all)
+        let lowered = selector.lowercased()
+        let (window, info) = lowered.hasPrefix("text:") || lowered.hasPrefix("ask:")
+            ? try await WindowResolver.resolveByContent(selector, in: all)
+            : try WindowResolver.resolve(selector, in: all)
         let final = dir.appendingPathComponent(fileName(app: info.app, override: o.name))
 
         if o.dryRun {
@@ -166,6 +189,8 @@ public enum Command {
         if let c = o.colors { settings.colors = c }
         if let f = o.fps { settings.fps = f }
         if let px = o.scale { settings.longEdge = px }
+        settings.trim = o.trim
+        let startedAt = Date()
 
         // Write beside the target, then rename, so a partial GIF never appears at the final path.
         let temp = dir.appendingPathComponent(".\(final.lastPathComponent).partial")
@@ -176,18 +201,40 @@ public enum Command {
         do { try FileManager.default.moveItem(at: r.url, to: final) }
         catch { throw GifwinError(.outputUnwritable, "Cannot write \(final.path): \(error.localizedDescription)") }
 
+        if o.clipboard { out.clipboardPath = final.path }
+
+        // Everything an agent needs to check and cite the clip, written beside it. A failure here never
+        // fails the capture: the GIF is already safely at its final path.
+        var extras: [String: Any] = [:]
+        if !o.noSidecar {
+            let meta = CaptureMeta(app: info.app, bundleID: info.bundleID, appVersion: AppInfo.version(pid: info.pid),
+                                   windowID: info.id, windowTitle: info.title, windowWidth: info.width, windowHeight: info.height,
+                                   displayScale: r.displayScale, startedAt: startedAt, requestedSeconds: o.seconds,
+                                   quality: o.quality.rawValue, settings: settings)
+            do {
+                var finished = r
+                finished.url = final
+                let side = try await Sidecar.write(gif: final, capture: meta, result: finished, ai: !o.noAI)
+                extras = sidecarFields(side)
+                out.stderr += "contact sheet: \(side.contactSheetURL?.path ?? "-")\nmanifest: \(side.manifestURL.path)\n"
+            } catch {
+                extras["sidecar_error"] = (error as? GifwinError)?.message ?? error.localizedDescription
+                out.stderr += "gifwin: could not write the contact sheet or manifest: \(extras["sidecar_error"] ?? "")\n"
+            }
+        }
+
         if o.json {
-            out.stdout += try jsonString(["path": final.path, "bytes": r.bytes, "frames": r.frames, "width": r.width,
-                                          "height": r.height, "seconds": r.seconds, "truncated": r.truncated,
-                                          "quality": o.quality.rawValue, "app": info.app, "bundle_id": info.bundleID,
-                                          "window_title": info.title, "budget_met": r.budgetMet,
-                                          "budget_steps": r.budgetSteps] as [String: Any])
+            var result: [String: Any] = ["path": final.path, "bytes": r.bytes, "frames": r.frames, "width": r.width,
+                                         "height": r.height, "seconds": r.seconds, "truncated": r.truncated,
+                                         "quality": o.quality.rawValue, "app": info.app, "bundle_id": info.bundleID,
+                                         "window_title": info.title, "budget_met": r.budgetMet, "budget_steps": r.budgetSteps,
+                                         "trimmed_head_seconds": r.trimmedHead, "trimmed_tail_seconds": r.trimmedTail]
+            result.merge(extras) { _, new in new }
+            out.stdout += try jsonString(result)
         } else {
             out.stdout += final.path + "\n"
             out.stderr += "\(r.frames) frames, \(r.width)x\(r.height), \(r.bytes / 1024) KB, \(String(format: "%.1f", r.seconds)) s\n"
         }
-        if o.clipboard { out.clipboardPath = final.path }
-
         if !r.budgetMet {
             out.stderr += "gifwin: could not reach \(o.maxBytes ?? 0) bytes; smallest result is \(r.bytes)\n"
             out.code = ExitCode.budgetUnreachable.rawValue
@@ -197,6 +244,47 @@ public enum Command {
         }
     }
 
+    // MARK: - describe
+
+    /// Analyses a GIF that already exists: writes its contact sheet and manifest, keeping the capture
+    /// facts from an earlier manifest if there is one.
+    private static func describe(_ req: Request, _ out: inout Outcome) async throws {
+        var path: String?, json = false, ai = true
+        for a in req.args.dropFirst() {
+            switch a {
+            case "--json": json = true
+            case "--no-ai": ai = false
+            default:
+                if a.hasPrefix("-") { throw GifwinError(.usage, "unknown argument '\(a)'\n\n\(usage)") }
+                path = a
+            }
+        }
+        guard let path else { throw GifwinError(.usage, "describe needs a GIF path\n\n\(usage)") }
+        let base = URL(fileURLWithPath: req.cwd.isEmpty ? FileManager.default.currentDirectoryPath : req.cwd, isDirectory: true)
+        let gif = URL(fileURLWithPath: path, relativeTo: base).standardizedFileURL
+        guard FileManager.default.fileExists(atPath: gif.path) else { throw GifwinError(.usage, "no such file: \(gif.path)") }
+
+        let side = try await Sidecar.write(gif: gif, capture: Sidecar.existingCapture(for: gif), result: nil, ai: ai)
+        if json {
+            var fields = sidecarFields(side)
+            fields["path"] = gif.path
+            out.stdout += try jsonString(fields)
+        } else {
+            out.stdout += side.manifest.analysis.caption + "\n" + side.manifest.analysis.altText + "\n"
+            out.stderr += "contact sheet: \(side.contactSheetURL?.path ?? "-")\nmanifest: \(side.manifestURL.path)\n"
+        }
+    }
+
+    /// The part of a result an agent reads: where the evidence is, and what it says.
+    static func sidecarFields(_ side: SidecarResult) -> [String: Any] {
+        let m = side.manifest
+        return ["contact_sheet": side.contactSheetURL?.path ?? NSNull(), "manifest": side.manifestURL.path,
+                "caption": m.analysis.caption, "alt_text": m.analysis.altText, "caption_source": m.analysis.captionSource,
+                "caption_note": m.analysis.captionNote ?? NSNull(),
+                "sha256": m.output.sha256, "duration_seconds": m.output.durationSeconds,
+                "keyframes": m.analysis.keyframes.map { ["index": $0.index, "time_seconds": $0.timeSeconds, "text": $0.text] as [String: Any] }]
+    }
+
     // MARK: - doctor
 
     /// Reports whether this process may record the screen, without triggering the system prompt.
@@ -204,6 +292,7 @@ public enum Command {
         let granted = CGPreflightScreenCaptureAccess()
         out.stdout += "process: \(ProcessInfo.processInfo.processIdentifier)  \(ProcessInfo.processInfo.arguments.first ?? "")\n"
         out.stdout += "screen recording: \(granted ? "granted" : "NOT granted")\n"
+        out.stdout += "caption model: \(Describe.modelStatus())  (without it, captions come from metadata and OCR text)\n"
         if !granted {
             out.stdout += "fix: grant Screen Recording to Gifwin in System Settings > Privacy & Security > Screen & System Audio Recording\n"
             out.stdout += "     open \(GifwinError.settingsURL)\n"
@@ -256,6 +345,15 @@ public enum Command {
             case "-o", "--out": o.out = try value(a)
             case "--name": o.name = try value(a)
             case "--clipboard": o.clipboard = true
+            case "--trim":
+                switch try value(a) {
+                case "auto": o.trim = true
+                case "none": o.trim = false
+                default: throw GifwinError(.usage, "--trim takes auto or none")
+                }
+            case "--no-ai": o.noAI = true
+            case "--no-sidecar": o.noSidecar = true
+            case "--ocr": o.ocr = true
             case "--list": o.list = true
             case "--dry-run": o.dryRun = true
             case "--json": o.json = true

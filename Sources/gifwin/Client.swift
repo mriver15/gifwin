@@ -10,43 +10,59 @@ enum Client {
         var args = args
         let direct = args.contains("--direct") || ProcessInfo.processInfo.environment["GIFWIN_DIRECT"] == "1"
         args.removeAll { $0 == "--direct" }
+        let request = Request(op: args == ["quit"] ? "quit" : "run", args: args,
+                              cwd: FileManager.default.currentDirectoryPath, env: forwardedEnvironment())
+        let outcome = await dispatch(request, direct: direct)
+        let bundle = direct ? nil : bundlePath()
+        return emit(outcome, prefix: args == ["doctor"] ? bundle.map { "app: \($0)\n" } ?? "" : "")
+    }
 
+    static func forwardedEnvironment() -> [String: String] {
         var env: [String: String] = [:]
         for key in Request.forwardedEnvironment {
             if let v = ProcessInfo.processInfo.environment[key] { env[key] = v }
         }
-        let request = Request(op: args == ["quit"] ? "quit" : "run", args: args,
-                              cwd: FileManager.default.currentDirectoryPath, env: env)
+        return env
+    }
 
+    /// Runs a request in the Gifwin.app helper, or in this process when asked to or when no app is
+    /// installed. Failures to reach the helper come back as an `Outcome`, never a crash, so the CLI and
+    /// the MCP server report them the same way.
+    static func dispatch(_ request: Request, direct: Bool = false) async -> Outcome {
         if direct { return await runLocally(request) }
         guard let bundle = bundlePath() else {
-            if args != ["quit"] {
-                warn("Gifwin.app not found, capturing in this process: Screen Recording will attach to your terminal. Run scripts/bundle.sh --install.")
+            var outcome = await runLocally(request)
+            if request.op != "quit" {
+                outcome.stderr = "gifwin: Gifwin.app not found, capturing in this process: Screen Recording will attach to your terminal. Run scripts/bundle.sh --install.\n" + outcome.stderr
             }
-            return await runLocally(request)
+            return outcome
         }
-
         guard let fd = connectOrLaunch(bundle: bundle, launch: request.op != "quit") else {
-            if request.op == "quit" { return 0 } // nothing running is the state quit asks for
-            warn("could not start the Gifwin helper from \(bundle)")
-            return ExitCode.internalFailure.rawValue
+            var outcome = Outcome()
+            if request.op != "quit" {
+                outcome.code = ExitCode.internalFailure.rawValue
+                outcome.stderr = "gifwin: could not start the Gifwin helper from \(bundle)\n"
+            }
+            return outcome
         }
         defer { close(fd) }
-        guard let payload = try? JSONEncoder().encode(request) else { return ExitCode.internalFailure.rawValue }
+        var failed = Outcome()
+        failed.code = ExitCode.internalFailure.rawValue
+        guard let payload = try? JSONEncoder().encode(request) else { return failed }
         Socket.writeAll(fd, payload + Data([10]))
         shutdown(fd, SHUT_WR)
         guard let outcome = try? JSONDecoder().decode(Outcome.self, from: Socket.readAll(fd)) else {
-            warn("the Gifwin helper closed the connection without an answer")
-            return ExitCode.internalFailure.rawValue
+            failed.stderr = "gifwin: the Gifwin helper closed the connection without an answer\n"
+            return failed
         }
-        return emit(outcome, prefix: args == ["doctor"] ? "app: \(bundle)\n" : "")
+        return outcome
     }
 
-    private static func runLocally(_ request: Request) async -> Int32 {
-        if request.op == "quit" { return 0 }
+    private static func runLocally(_ request: Request) async -> Outcome {
+        if request.op == "quit" { return Outcome() }
         let outcome = await Command.run(request)
         if let path = outcome.clipboardPath { Clipboard.copy(path: path) }
-        return emit(outcome)
+        return outcome
     }
 
     private static func emit(_ outcome: Outcome, prefix: String = "") -> Int32 {

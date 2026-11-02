@@ -53,6 +53,9 @@ public enum Fit {
             }
             if best.bytes <= maxBytes { break }
         }
+        best.trimmedHead = result.trimmedHead
+        best.trimmedTail = result.trimmedTail
+        best.displayScale = result.displayScale
         best.budgetSteps = steps
         best.budgetMet = best.bytes <= maxBytes
         best.truncated = result.truncated

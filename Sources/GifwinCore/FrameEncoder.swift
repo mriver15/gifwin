@@ -7,6 +7,9 @@ public struct EncodeStats: Sendable {
     public let height: Int
     /// Total playback time of the written clip, in seconds.
     public let duration: Double
+    /// Seconds of still footage cut from the start and the end.
+    public let trimmedHead: Double
+    public let trimmedTail: Double
 }
 
 /// Turns a stream of timestamped frames into a compact GIF.
@@ -40,6 +43,9 @@ public final class FrameEncoder {
     private var firstTime = 0.0
     private var lastAcceptedTime = -Double.infinity
     private var emittedCS = 0.0
+    private var trimmedCS = 0.0
+    private var trimmedHeadCS = 0.0
+    private var trimmedTailCS = 0.0
     /// The newest frame that was dropped, kept so the clip can end on what was really on screen.
     private var heldBack: [UInt32]?
     private var heldBackTime = 0.0
@@ -89,19 +95,21 @@ public final class FrameEncoder {
         // End on the real final state even if it was too small a change to keep mid-clip.
         if let last = heldBack {
             let (count, bounds) = measure(last, tolerance: 0)
-            if count > 0, let bounds { try accept(last, bounds: bounds, at: heldBackTime) }
+            // This frame only exists to end on the real final state, so the stillness before it is the tail.
+            if count > 0, let bounds { try accept(last, bounds: bounds, at: heldBackTime, closing: true) }
             heldBack = nil
         }
-        try flush(until: max(endTime, pendingTime + 0.02))
+        try flush(until: max(endTime, pendingTime + 0.02), isLast: true)
         try writer.finish()
         return EncodeStats(frames: writer.frameCount, bytes: writer.bytesWritten,
-                           width: width, height: height, duration: emittedCS / 100)
+                           width: width, height: height, duration: emittedCS / 100,
+                           trimmedHead: trimmedHeadCS / 100, trimmedTail: trimmedTailCS / 100)
     }
 
     // MARK: - Accepting frames
 
-    private func accept(_ pixels: [UInt32], bounds: (Int, Int, Int, Int), at time: Double) throws {
-        try flush(until: time)
+    private func accept(_ pixels: [UInt32], bounds: (Int, Int, Int, Int), at time: Double, closing: Bool = false) throws {
+        try flush(until: time, isLast: closing)
         pending = encode(pixels, bounds: bounds, first: false)
         pendingTime = time
         lastAcceptedTime = time
@@ -270,13 +278,29 @@ public final class FrameEncoder {
     /// Writes the held-back frame with a delay that runs up to `next`. Delays are rounded against
     /// the running total, so a long clip cannot drift, and clamped to the rate's minimum because
     /// viewers promote 0 and 1 cs to 10.
-    private func flush(until next: Double) throws {
+    private func flush(until next: Double, isLast: Bool = false) throws {
         guard let frame = pending else { return }
-        let target = (next - firstTime) * 100
-        let delay = max(settings.minDelayCS, Int((target - emittedCS).rounded()))
+        let target = (next - firstTime) * 100 - trimmedCS
+        var delay = max(settings.minDelayCS, Int((target - emittedCS).rounded()))
+
+        // A capture started a beat early or stopped a beat late is mostly one still frame with a long
+        // delay. Cap those, and remember what was cut so later delays do not stretch to make it up.
+        if settings.trim {
+            let first = writer.frameCount == 0
+            let cap = first && isLast ? Self.onlyFrameCap : first ? Self.headCap : isLast ? Self.tailCap : Int.max
+            if delay > cap {
+                let cut = Double(delay - cap)
+                trimmedCS += cut
+                if first { trimmedHeadCS += cut } else { trimmedTailCS += cut }
+                delay = cap
+            }
+        }
         try writer.addFrame(x: frame.x, y: frame.y, w: frame.w, h: frame.h, indices: frame.indices,
                             palette: frame.palette, transparent: frame.transparent, delayCS: delay)
         emittedCS += Double(delay)
         pending = nil
     }
+
+    /// Longest a still opening, closing or lone frame may linger, in centiseconds.
+    static let headCap = 50, tailCap = 80, onlyFrameCap = 100
 }

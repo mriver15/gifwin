@@ -2,8 +2,8 @@ import Foundation
 
 /// Everything that decides how a clip is encoded. The presets are the spec's table; `--colors`,
 /// `--fps` and `--scale` override individual fields.
-public struct EncoderSettings: Sendable, Equatable {
-    public enum Dither: Sendable { case off, adaptive, bayer }
+public struct EncoderSettings: Sendable, Equatable, Codable {
+    public enum Dither: String, Sendable, Codable { case off, adaptive, bayer }
 
     public var colors: Int
     public var fps: Double
@@ -13,6 +13,9 @@ public struct EncoderSettings: Sendable, Equatable {
     public var dropFraction: Double
     /// Per-channel difference a pixel must exceed before it counts as changed.
     public var tolerance: Int
+    /// Cap the still head and tail of a clip (see `FrameEncoder`). Off by default so the encoder
+    /// reproduces its input's timing exactly; the CLI turns it on.
+    public var trim = false
 
     /// GIF delays are whole centiseconds, so only these rates divide evenly.
     public static let allowedFPS: [Double] = [10, 12.5, 100.0 / 6.0, 20]

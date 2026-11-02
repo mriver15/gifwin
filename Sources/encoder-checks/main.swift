@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import CoreText
 import ImageIO
 import GifwinCore
 
@@ -269,6 +270,204 @@ func budgetLadder() throws {
     check(impossible.bytes <= fitted.bytes, "an unreachable budget must not grow the file")
 }
 
+
+// MARK: - Agent layer: trim, keyframes, contact sheet, manifest, describe
+
+/// Runs async work from the synchronous check harness.
+final class Box<V>: @unchecked Sendable { var value: Result<V, Error>? }
+
+func block<T>(_ work: @escaping @Sendable () async throws -> T) throws -> T {
+    let box = Box<T>()
+    let done = DispatchSemaphore(value: 0)
+    Task { do { box.value = .success(try await work()) } catch { box.value = .failure(error) }; done.signal() }
+    done.wait()
+    return try box.value!.get()
+}
+
+/// A frame of solid colour with `lines` of large text, drawn with CoreText into BGRA pixels.
+func textFrame(_ lines: [String], background: (Int, Int, Int), w: Int, h: Int) -> [UInt32] {
+    var px = [UInt32](repeating: pack(background.0, background.1, background.2), count: w * h)
+    px.withUnsafeMutableBytes { raw in
+        guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return }
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 44, nil)
+        for (i, text) in lines.enumerated() {
+            let attrs: [CFString: Any] = [kCTFontAttributeName: font, kCTForegroundColorAttributeName: CGColor(red: 0, green: 0, blue: 0, alpha: 1)]
+            let line = CTLineCreateWithAttributedString(CFAttributedStringCreate(nil, text as CFString, attrs as CFDictionary)!)
+            ctx.textPosition = CGPoint(x: 40, y: Double(h) - 110 - Double(i) * 70)
+            CTLineDraw(line, ctx)
+        }
+    }
+    return px
+}
+
+func encodeClip(_ frames: [[UInt32]], w: Int, h: Int, settings: EncoderSettings, to url: URL, tick: Double? = nil) throws -> EncodeStats {
+    let writer = try GIFWriter(url: url, width: w, height: h)
+    let enc = FrameEncoder(writer: writer, settings: settings)
+    let step = tick ?? 1 / settings.fps
+    for (i, f) in frames.enumerated() { try enc.add(f, at: Double(i) * step) }
+    return try enc.finish(endTime: Double(frames.count) * step)!
+}
+
+let sceneW = 640, sceneH = 360
+let scenes: [(words: [String], bg: (Int, Int, Int))] = [
+    (["COMPILING SOURCES"], (200, 220, 255)),
+    (["RUNNING TESTS"], (255, 245, 200)),
+    (["BUILD PASSED"], (200, 255, 210)),
+]
+/// Three scenes, each held for 8 frames: a stand-in for "something happens, then something else".
+func sceneClip() -> [[UInt32]] {
+    scenes.flatMap { sc in [[UInt32]](repeating: textFrame(sc.words, background: sc.bg, w: sceneW, h: sceneH), count: 8) }
+}
+
+func trimsStillHeadAndTail() throws {
+    // 20 still frames, a burst of change, 15 still frames.
+    var frames: [[UInt32]] = []
+    let a = textFrame(["BEFORE"], background: (240, 240, 240), w: 320, h: 200)
+    let b = textFrame(["AFTER"], background: (220, 240, 255), w: 320, h: 200)
+    frames += [[UInt32]](repeating: a, count: 20)
+    for i in 0..<5 { var f = a; for p in 0..<(320 * 200) where (p / 320) < 40 * (i + 1) { f[p] = b[p] }; frames.append(f) }
+    frames += [[UInt32]](repeating: b, count: 15)
+
+    var s = Quality.balanced.settings
+    let plain = tempURL(), trimmed = tempURL()
+    defer { try? FileManager.default.removeItem(at: plain); try? FileManager.default.removeItem(at: trimmed) }
+    let before = try encodeClip(frames, w: 320, h: 200, settings: s, to: plain)
+    s.trim = true
+    let after = try encodeClip(frames, w: 320, h: 200, settings: s, to: trimmed)
+
+    if let idx = try? Analysis.index(trimmed), let idx0 = try? Analysis.index(plain) {
+        print("  delays plain:  ", idx0.delays.map { Int(($0 * 100).rounded()) })
+        print("  delays trimmed:", idx.delays.map { Int(($0 * 100).rounded()) })
+    }
+    print("  untrimmed \(before.duration) s, trimmed \(after.duration) s (head \(after.trimmedHead) s, tail \(after.trimmedTail) s)")
+    check(abs(before.duration - 3.2) < 0.05, "untrimmed duration \(before.duration)")
+    check(abs(after.trimmedHead - 1.1) < 0.1, "head trim \(after.trimmedHead), wanted about 1.1")
+    check(abs(after.trimmedTail - 0.4) < 0.1, "tail trim \(after.trimmedTail), wanted about 0.4")
+    check(abs(after.duration - (before.duration - after.trimmedHead - after.trimmedTail)) < 0.05,
+          "the burst in the middle must keep its timing: \(after.duration) vs \(before.duration - after.trimmedHead - after.trimmedTail)")
+    check(after.frames == before.frames, "trimming must not drop frames")
+}
+
+func keyframesFollowTheChange() throws {
+    // Big change in the first 6 frames, then 24 frames of only a small moving cursor.
+    var frames: [[UInt32]] = []
+    for i in 0..<6 { frames.append([UInt32](repeating: pack(i * 40, 255 - i * 40, 128), count: 320 * 200)) }
+    let still = frames.last!
+    for i in 0..<24 { var f = still; for y in 90..<100 { for x in (10 + i * 10)..<(18 + i * 10) { f[y * 320 + x] = pack(0, 0, 0) } }; frames.append(f) }
+    var s = Quality.max.settings
+    s.trim = false
+    let url = tempURL()
+    defer { try? FileManager.default.removeItem(at: url) }
+    _ = try encodeClip(frames, w: 320, h: 200, settings: s, to: url)
+    let clip = try Analysis.index(url)
+    let picks = Analysis.keyframes(clip)
+    print("  \(clip.count) frames, keyframes \(picks)")
+    check(picks.count == 6 && picks == picks.sorted() && Set(picks).count == 6, "want 6 ascending unique picks, got \(picks)")
+    check(picks.first == 0 && picks.last == clip.count - 1, "first and last frame must both be shown: \(picks)")
+    check(picks.filter { $0 <= 7 }.count >= 3, "at least half the picks should sit in the burst of change: \(picks)")
+
+    // Fewer frames than tiles: show them all.
+    let short = tempURL()
+    defer { try? FileManager.default.removeItem(at: short) }
+    _ = try encodeClip(scenes.map { textFrame($0.words, background: $0.bg, w: 320, h: 200) }, w: 320, h: 200, settings: s, to: short, tick: 0.5)
+    check(Analysis.keyframes(try Analysis.index(short)) == [0, 1, 2], "a 3-frame clip should show all 3 frames")
+}
+
+func captionParsing() throws {
+    let plain = Describe.parse("CAPTION: Tests fail then pass\nALT: A terminal shows a failing test, then a fix, then all tests passing.")
+    check(plain?.caption == "Tests fail then pass" && plain?.altText.hasPrefix("A terminal shows") == true, "plain labels: \(String(describing: plain))")
+    // What the on-device model actually returned in practice: bold labels.
+    let bold = Describe.parse("**CAPTION:** Terminal shows test results\n**ALT:** The window lists a failure and then a pass.")
+    check(bold?.caption == "Terminal shows test results" && bold?.altText == "The window lists a failure and then a pass.", "bold labels: \(String(describing: bold))")
+    let bullets = Describe.parse("- caption: \"Quoted caption\"\n- Alt text: Something happens.")
+    check(bullets?.caption == "Quoted caption" && bullets?.altText == "Something happens.", "bullets, quotes, case: \(String(describing: bullets))")
+    check(Describe.parse("Here is a caption for you!") == nil, "prose with no labels must be rejected, not guessed at")
+    check(Describe.parse("CAPTION: only one field") == nil, "a missing field must be rejected")
+    check(Describe.parse("CAPTION:\nALT: x") == nil, "an empty field must be rejected")
+}
+
+func sidecarEndToEnd() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("gifwin-sidecar-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let gif = dir.appendingPathComponent("demo.gif")
+    var s = Quality.crisp.settings
+    s.trim = true
+    let stats = try encodeClip(sceneClip(), w: sceneW, h: sceneH, settings: s, to: gif)
+
+    let meta = CaptureMeta(app: "Demo App", bundleID: "com.example.demo", appVersion: "2.4.1 (318)", windowID: 4242,
+                           windowTitle: "Build output", windowWidth: 800, windowHeight: 450, displayScale: 2,
+                           startedAt: Date(timeIntervalSince1970: 1_800_000_000), requestedSeconds: 5, quality: "crisp", settings: s)
+    var result = CaptureResult(url: gif, width: sceneW, height: sceneH, frames: stats.frames, bytes: stats.bytes,
+                               seconds: stats.duration, truncated: false)
+    result.trimmedHead = stats.trimmedHead
+    let finished = result
+    let side = try block { try await Sidecar.write(gif: gif, capture: meta, result: finished, ai: true) }
+    let m = side.manifest
+
+    // The evidence record is true to the file it describes.
+    let bytes = try Data(contentsOf: gif)
+    check(m.output.sha256 == Sidecar.sha256(bytes), "manifest sha256 does not match the GIF")
+    check(m.output.bytes == bytes.count && m.output.frames == stats.frames, "manifest size/frames disagree with the GIF")
+    check(abs(m.output.durationSeconds - stats.duration) < 0.02, "manifest duration \(m.output.durationSeconds) vs \(stats.duration)")
+    check(m.output.delaysCentiseconds.reduce(0, +) == Int((stats.duration * 100).rounded()), "per-frame delays do not sum to the duration")
+    check(m.os.build.count >= 4 && m.os.version.hasPrefix("macOS"), "OS block incomplete: \(m.os)")
+
+    // Capture facts survive a trip through the file (snake_case keys, ISO dates).
+    let back = Sidecar.existingCapture(for: gif)
+    check(back?.bundleId == "com.example.demo" && back?.windowId == 4242 && back?.appVersion == "2.4.1 (318)", "capture facts lost on round trip: \(String(describing: back))")
+    check(back?.startedAt == meta.startedAt && back?.settings == s, "date or settings lost on round trip")
+    let raw = try String(contentsOf: side.manifestURL, encoding: .utf8)
+    check(raw.contains("\"bundle_id\"") && raw.contains("\"sha256\"") && raw.contains("\"started_at\""), "manifest keys are not snake_case")
+
+    // OCR reads the scenes, and each keyframe carries the words shown at that moment.
+    let text = m.analysis.keyframes.map { $0.text.joined(separator: " ").uppercased() }
+    print("  keyframes:", m.analysis.keyframes.map { "#\($0.index)@\($0.timeSeconds)s \($0.text.first ?? "-")" })
+    for (i, scene) in scenes.enumerated() {
+        let want = scene.words[0]
+        check(text.contains { $0.contains(want) }, "scene \(i) '\(want)' never read by OCR; saw \(text)")
+    }
+    check(text.first?.contains("COMPILING") == true && text.last?.contains("PASSED") == true, "first/last keyframes should show first/last scenes: \(text)")
+
+    // Caption and alt text are built only from what was read.
+    print("  caption (\(m.analysis.captionSource)): \(m.analysis.caption)")
+    check(!m.analysis.caption.isEmpty && !m.analysis.altText.isEmpty, "empty caption or alt text")
+    check(m.analysis.caption.count <= 160, "caption too long: \(m.analysis.caption.count)")
+
+    // The contact sheet is a real PNG with the first frame at the top left and the last at the bottom right.
+    guard let sheetURL = side.contactSheetURL, let src = CGImageSourceCreateWithURL(sheetURL as CFURL, nil),
+          let sheet = CGImageSourceCreateImageAtIndex(src, 0, nil) else { check(false, "no decodable contact sheet"); return }
+    print("  contact sheet \(sheet.width)x\(sheet.height), \((try? Data(contentsOf: sheetURL).count) ?? 0) B")
+    check(sheet.width >= 1000 && sheet.width <= 1600 && sheet.height >= 300, "unreasonable sheet size \(sheet.width)x\(sheet.height)")
+    let pixels = Fit.bgra(sheet, width: sheet.width, height: sheet.height)
+    func at(_ x: Int, _ y: Int) -> (Int, Int, Int) { let v = pixels[y * sheet.width + x]; return (Int((v >> 16) & 255), Int((v >> 8) & 255), Int(v & 255)) }
+    let tileW = 480, tileH = 270, gutter = 8, strip = 24   // 640x360 fitted into 480x360, label strip above
+    let first = at(gutter + 240, gutter + strip + tileH - 12)
+    let lastSlot = m.analysis.keyframes.count - 1
+    let lastX = gutter + (lastSlot % 3) * (tileW + gutter) + 240
+    let lastY = gutter + (lastSlot / 3) * (tileH + strip + gutter) + strip + tileH - 12
+    let last = at(lastX, lastY)
+    check(abs(first.0 - 200) < 12 && abs(first.2 - 255) < 12, "top-left tile should be the first scene (pale blue), got \(first)")
+    check(abs(last.1 - 255) < 12 && abs(last.0 - 200) < 12, "last tile should be the final scene (pale green), got \(last)")
+
+    // describe on the finished file works from the command layer and returns the same evidence.
+    let described = try block { await Command.run(Request(args: ["describe", gif.path, "--json"], cwd: "/")) }
+    let d = try JSONSerialization.jsonObject(with: Data(described.stdout.utf8)) as? [String: Any]
+    check(described.code == 0 && d?["sha256"] as? String == m.output.sha256, "describe --json should repeat the manifest's hash")
+    check((d?["contact_sheet"] as? String).map { FileManager.default.fileExists(atPath: $0) } == true, "describe: contact sheet path not on disk")
+    check(Sidecar.existingCapture(for: gif)?.bundleId == "com.example.demo", "describe must keep the original capture facts")
+
+    // --no-ai keeps the sheet and manifest but reads nothing.
+    let quiet = try block { try await Sidecar.write(gif: gif, capture: meta, result: finished, ai: false) }
+    check(quiet.manifest.analysis.keyframes.allSatisfy { $0.text.isEmpty } && quiet.manifest.analysis.ocr == false, "--no-ai must not read text")
+    check(quiet.manifest.analysis.captionSource == "deterministic" && quiet.contactSheetURL != nil, "--no-ai should fall back to a metadata caption and still make the sheet")
+
+    let missing = try block { await Command.run(Request(args: ["describe", dir.appendingPathComponent("nope.gif").path], cwd: "/")) }
+    check(missing.code == 64, "describe of a missing file should be a usage error")
+}
+
 // MARK: - Run
 
 let all: [(String, () throws -> Void)] = [
@@ -285,6 +484,10 @@ let all: [(String, () throws -> Void)] = [
     ("identical output for identical input", deterministic),
     ("dither is temporally stable", ditherIsTemporallyStable),
     ("byte budget ladder", budgetLadder),
+    ("trim caps still head and tail, keeps the middle's timing", trimsStillHeadAndTail),
+    ("keyframes follow the change", keyframesFollowTheChange),
+    ("caption replies parse however the model dresses them", captionParsing),
+    ("sheet, manifest, OCR, caption, describe", sidecarEndToEnd),
 ]
 for (name, run) in all {
     let before = failures

@@ -16,6 +16,10 @@ public struct CaptureResult: Sendable {
     public var budgetMet = true
     /// Re-encode passes spent meeting the budget.
     public var budgetSteps = 0
+    public var trimmedHead = 0.0
+    public var trimmedTail = 0.0
+    /// Device pixels per point of the display the window was on.
+    public var displayScale = 1.0
 
     public init(url: URL, width: Int, height: Int, frames: Int, bytes: Int, seconds: Double, truncated: Bool,
                 budgetMet: Bool = true, budgetSteps: Int = 0) {
@@ -146,7 +150,11 @@ public enum Capture {
         guard let stats else {
             throw GifwinError(.internalFailure, "No frames were delivered. Is the window visible and not minimized?")
         }
-        return CaptureResult(url: url, width: stats.width, height: stats.height, frames: stats.frames,
-                             bytes: stats.bytes, seconds: stats.duration, truncated: truncated)
+        var result = CaptureResult(url: url, width: stats.width, height: stats.height, frames: stats.frames,
+                                   bytes: stats.bytes, seconds: stats.duration, truncated: truncated)
+        result.trimmedHead = stats.trimmedHead
+        result.trimmedTail = stats.trimmedTail
+        result.displayScale = pixelScale
+        return result
     }
 }
