@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+*.gif
+*.gifwin.json
