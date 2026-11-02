@@ -123,7 +123,7 @@ public enum Capture {
         do {
             try await stream.startCapture()
         } catch {
-            throw GifwinError(.permissionDenied, "Could not start capture: \(error.localizedDescription)")
+            throw GifwinError.permission("Could not start capture: \(error.localizedDescription)")
         }
 
         // Poll so a window that closes mid-capture ends the wait early instead of idling to the deadline.

@@ -17,8 +17,7 @@ public enum WindowResolver {
         do {
             content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
         } catch {
-            throw GifwinError(.permissionDenied,
-                "Screen Recording permission is not granted. Enable it in System Settings > Privacy & Security > Screen & System Audio Recording.")
+            throw GifwinError.permission("Screen Recording permission is not granted.")
         }
         return content.windows
             .filter { $0.windowLayer == 0 && $0.frame.width >= 100 && $0.frame.height >= 60 && $0.owningApplication != nil }
