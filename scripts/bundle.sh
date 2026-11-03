@@ -6,13 +6,21 @@
 #   SIGN_IDENTITY="Developer ID Application: Name (TEAMID)" scripts/bundle.sh
 #
 # Ad-hoc signing gives the app no stable identity, so macOS forgets the Screen Recording grant
-# every time the binary changes. A real certificate (Developer ID or Apple Development) keeps it.
+# every time the binary changes. A certificate keeps it. With no SIGN_IDENTITY set, this uses the local
+# one from scripts/dev-cert.sh if it exists, and falls back to ad-hoc (with a warning) if not.
 set -euo pipefail
 cd "${0:A:h}/.."
 
 BUNDLE_ID="${BUNDLE_ID:-io.github.mriver15.gifwin}"
 VERSION="$(grep -o 'version = "[0-9.]*"' Sources/GifwinCore/Command.swift | head -1 | grep -o '[0-9.]*')"
 IDENTITY="${SIGN_IDENTITY:--}"
+KEYCHAIN_ARGS=()
+DEV_KC="$HOME/.config/gifwin/dev.keychain-db"
+if [[ -z "${SIGN_IDENTITY:-}" && -f "$DEV_KC" ]]; then
+    security unlock-keychain -p "gifwin-dev" "$DEV_KC" 2>/dev/null || true
+    IDENTITY="Gifwin Local Dev"
+    KEYCHAIN_ARGS=(--keychain "$DEV_KC")
+fi
 APP="build/Gifwin.app"
 
 swift build -c release 2>&1 | grep -E 'error|Compiling|Build complete' | tail -1
@@ -41,10 +49,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
-codesign --force --options runtime --identifier "$BUNDLE_ID" --sign "$IDENTITY" "$APP"
+codesign --force --options runtime --identifier "$BUNDLE_ID" "${KEYCHAIN_ARGS[@]}" --sign "$IDENTITY" "$APP"
 codesign --verify --strict "$APP"
 
 echo "built $APP ($VERSION), signed with: $([[ "$IDENTITY" == "-" ]] && echo 'ad-hoc' || echo "$IDENTITY")"
+[[ "$IDENTITY" == "-" ]] && echo "  warning: ad-hoc, so the Screen Recording grant is lost on every rebuild. Run scripts/dev-cert.sh once."
 codesign -dv "$APP" 2>&1 | grep -E 'Identifier|Signature|TeamIdentifier|CDHash' | sed 's/^/  /'
 du -sh "$APP/Contents/MacOS/gifwin" | awk '{print "  binary: " $1}'
 
